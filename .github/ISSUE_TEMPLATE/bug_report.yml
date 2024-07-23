@@ -5,12 +5,17 @@ body:
   - type: markdown
     attributes:
       value: |
-        感谢反馈，请填写以下表单
+        感谢反馈，请填写以下表单。
+
+        **注意事项**
+
+        1. **请先搜索历史 issue，避免重复反馈相同的问题, 否则直接关闭 issue**
+        2. **请勿反馈类似 `operation timed out`/`dns error`/`connection reset` 等网络问题, 请自行排查运行环境网络状况**
   - type: textarea
     id: description
     attributes:
       label: 问题描述
-      description: 请提供问题的简要描述
+      description: 请提供问题的简要描述和你已经尝试过的解决方案
       placeholder: The bug is...
     validations:
       required: true
@@ -18,7 +23,7 @@ body:
     id: reproduce
     attributes:
       label: 重现步骤
-      description: 请提供重现该问题的详细步骤
+      description: 请提供重现该问题的详细步骤, 否则直接关闭 issue.
       placeholder: |
         1.
         2.
@@ -29,6 +34,7 @@ body:
     id: version
     attributes:
       label: 版本
+      placeholder: 请提供具体版本号如 1.7.4 而不是"最新版"
     validations:
       required: true
   - type: input
@@ -36,6 +42,7 @@ body:
     attributes:
       label: 运行平台
       placeholder: 什么路由器/盒子？Docker？Windows/Linux/macOS？
+      description: 提示:Docker 请先确认是从官方镜像源安装
     validations:
       required: true
   - type: textarea

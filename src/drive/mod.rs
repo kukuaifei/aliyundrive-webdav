@@ -1,15 +1,19 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
+use clap::ValueEnum;
+use dav_server::fs::{DavDirEntry, DavMetaData, FsFuture, FsResult};
 use futures_util::future::FutureExt;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
-    StatusCode,
+    IntoUrl, StatusCode,
 };
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::{
@@ -17,23 +21,35 @@ use tokio::{
     time,
 };
 use tracing::{debug, error, info, warn};
-use webdav_handler::fs::{DavDirEntry, DavMetaData, FsFuture, FsResult};
 
-mod model;
+pub mod model;
 
 use model::*;
 pub use model::{AliyunFile, DateTime, FileType};
 
 const ORIGIN: &str = "https://www.aliyundrive.com";
 const REFERER: &str = "https://www.aliyundrive.com/";
-const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36";
+const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.83 Safari/537.36";
+
+/// Aliyundrive drive type
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DriveType {
+    /// Resource drive
+    Resource,
+    /// Backup drive
+    Backup,
+    /// Default drive
+    Default,
+}
 
 #[derive(Debug, Clone)]
 pub struct DriveConfig {
     pub api_base_url: String,
-    pub refresh_token_url: String,
+    pub refresh_token_host: String,
     pub workdir: Option<PathBuf>,
-    pub app_id: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub drive_type: Option<DriveType>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,13 +61,14 @@ struct Credentials {
 #[derive(Debug, Clone)]
 pub struct AliyunDrive {
     config: DriveConfig,
-    client: reqwest::Client,
+    client: ClientWithMiddleware,
     credentials: Arc<RwLock<Credentials>>,
     drive_id: Option<String>,
 }
 
 impl AliyunDrive {
     pub async fn new(config: DriveConfig, refresh_token: String) -> Result<Self> {
+        let refresh_token_is_empty = refresh_token.is_empty();
         let credentials = Credentials {
             refresh_token,
             access_token: None,
@@ -59,6 +76,14 @@ impl AliyunDrive {
         let mut headers = HeaderMap::new();
         headers.insert("Origin", HeaderValue::from_static(ORIGIN));
         headers.insert("Referer", HeaderValue::from_static(REFERER));
+        if let Ok(canary_env) = std::env::var("ALIYUNDRIVE_CANARY") {
+            // 灰度环境：gray
+            headers.insert("X-Canary", HeaderValue::from_str(&canary_env)?);
+        }
+        let retry_policy = ExponentialBackoff::builder()
+            .backoff_exponent(2)
+            .retry_bounds(Duration::from_millis(100), Duration::from_secs(5))
+            .build_with_max_retries(3);
         let client = reqwest::Client::builder()
             .user_agent(UA)
             .default_headers(headers)
@@ -69,6 +94,10 @@ impl AliyunDrive {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()?;
+        let client = ClientBuilder::new(client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+        let drive_type = config.drive_type.clone();
         let mut drive = Self {
             config,
             client,
@@ -78,14 +107,16 @@ impl AliyunDrive {
 
         let (tx, rx) = oneshot::channel();
         // schedule update token task
-        let client = drive.clone();
         let refresh_token_from_file = if let Some(dir) = drive.config.workdir.as_ref() {
-            tokio::fs::read_to_string(dir.join("refresh_token"))
-                .await
-                .ok()
+            read_refresh_token(dir).await.ok()
         } else {
             None
         };
+        if refresh_token_is_empty && refresh_token_from_file.is_none() {
+            bail!("No refresh token provided! \n📝 Please specify refresh token from `--refresh-token` CLI option.");
+        }
+
+        let client = drive.clone();
         tokio::spawn(async move {
             let mut delay_seconds = 7000;
             match client
@@ -95,8 +126,8 @@ impl AliyunDrive {
                 Ok(res) => {
                     // token usually expires in 7200s, refresh earlier
                     delay_seconds = res.expires_in - 200;
-                    if tx.send(res.default_drive_id).is_err() {
-                        error!("send default drive id failed");
+                    if tx.send(res.access_token).is_err() {
+                        error!("send access_token failed");
                     }
                 }
                 Err(err) => {
@@ -112,11 +143,20 @@ impl AliyunDrive {
             }
         });
 
-        let drive_id = rx.await?;
-        if drive_id.is_empty() {
-            bail!("get default drive id failed");
+        let access_token = rx.await?;
+        if access_token.is_empty() {
+            bail!("get access_token failed");
         }
-        info!(drive_id = %drive_id, "found default drive");
+        let drive_type_str = match drive_type {
+            Some(DriveType::Resource) => "resource",
+            Some(DriveType::Backup) => "backup",
+            Some(DriveType::Default) | None => "default",
+        };
+        let drive_id = drive
+            .get_drive_id(drive_type)
+            .await
+            .context("get drive id failed")?;
+        info!(drive_id = %drive_id, "found {} drive", drive_type_str);
         drive.drive_id = Some(drive_id);
 
         Ok(drive)
@@ -135,22 +175,28 @@ impl AliyunDrive {
         let mut data = HashMap::new();
         data.insert("refresh_token", refresh_token);
         data.insert("grant_type", "refresh_token");
-        if let Some(app_id) = self.config.app_id.as_ref() {
-            data.insert("app_id", app_id);
+        if let Some(client_id) = self.config.client_id.as_ref() {
+            data.insert("client_id", client_id);
+        }
+        if let Some(client_secret) = self.config.client_secret.as_ref() {
+            data.insert("client_secret", client_secret);
         }
         let res = self
             .client
-            .post(&self.config.refresh_token_url)
+            .post(format!(
+                "{}/oauth/access_token",
+                &self.config.refresh_token_host
+            ))
             .json(&data)
             .send()
             .await?;
         match res.error_for_status_ref() {
             Ok(_) => {
                 let res = res.json::<RefreshTokenResponse>().await?;
-                info!(
+                info!("refresh token succeed");
+                debug!(
                     refresh_token = %res.refresh_token,
-                    nick_name = %res.nick_name,
-                    "refresh token succeed"
+                    "new refresh token"
                 );
                 Ok(res)
             }
@@ -223,7 +269,7 @@ impl AliyunDrive {
 
     async fn access_token(&self) -> Result<String> {
         let cred = self.credentials.read().await;
-        Ok(cred.access_token.clone().context("missing access_token")?)
+        cred.access_token.clone().context("missing access_token")
     }
 
     fn drive_id(&self) -> Result<&str> {
@@ -243,17 +289,21 @@ impl AliyunDrive {
             .bearer_auth(&access_token)
             .json(&req)
             .send()
-            .await?
-            .error_for_status();
-        match res {
-            Ok(res) => {
+            .await?;
+        match res.error_for_status_ref() {
+            Ok(_) => {
                 if res.status() == StatusCode::NO_CONTENT {
                     return Ok(None);
                 }
+                // let res = res.text().await?;
+                // println!("{}: {}", url, res);
+                // let res = serde_json::from_str(&res)?;
                 let res = res.json::<U>().await?;
                 Ok(Some(res))
             }
             Err(err) => {
+                let err_msg = res.text().await?;
+                debug!(error = %err_msg, url = %url, "request failed");
                 match err.status() {
                     Some(
                         status_code
@@ -296,25 +346,42 @@ impl AliyunDrive {
         }
     }
 
-    pub async fn get_by_path(&self, path: &str) -> Result<Option<AliyunFile>> {
-        let drive_id = self.drive_id()?;
-        debug!(drive_id = %drive_id, path = %path, "get file by path");
-        if path == "/" || path.is_empty() {
-            return Ok(Some(AliyunFile::new_root()));
-        }
-        let req = GetFileByPathRequest {
-            drive_id,
-            file_path: path,
-        };
-        let res: Result<AliyunFile> = self
+    pub async fn get_drive_id(&self, drive_type: Option<DriveType>) -> Result<String> {
+        let req = HashMap::<String, String>::new();
+        let res: GetDriveInfoResponse = self
             .request(
-                format!("{}/v2/file/get_by_path", self.config.api_base_url),
+                format!("{}/adrive/v1.0/user/getDriveInfo", self.config.api_base_url),
+                &req,
+            )
+            .await
+            .and_then(|res| res.context("expect response"))?;
+        let drive_id = match drive_type {
+            Some(DriveType::Resource) => res.resource_drive_id.unwrap_or_else(|| {
+                warn!("resource drive not found, use default drive instead");
+                res.default_drive_id
+            }),
+            Some(DriveType::Backup) => res.backup_drive_id.unwrap_or_else(|| {
+                warn!("backup drive not found, use default drive instead");
+                res.default_drive_id
+            }),
+            Some(DriveType::Default) | None => res.default_drive_id,
+        };
+        Ok(drive_id)
+    }
+
+    pub async fn get_file(&self, file_id: &str) -> Result<Option<AliyunFile>> {
+        let drive_id = self.drive_id()?;
+        debug!(drive_id = %drive_id, file_id = %file_id, "get file");
+        let req = GetFileRequest { drive_id, file_id };
+        let res: Result<GetFileResponse> = self
+            .request(
+                format!("{}/adrive/v1.0/openFile/get", self.config.api_base_url),
                 &req,
             )
             .await
             .and_then(|res| res.context("expect response"));
         match res {
-            Ok(file) => Ok(Some(file)),
+            Ok(file) => Ok(Some(file.into())),
             Err(err) => {
                 if let Some(req_err) = err.downcast_ref::<reqwest::Error>() {
                     if matches!(req_err.status(), Some(StatusCode::NOT_FOUND)) {
@@ -329,12 +396,38 @@ impl AliyunDrive {
         }
     }
 
+    pub async fn get_by_path(&self, path: &str) -> Result<Option<AliyunFile>> {
+        let drive_id = self.drive_id()?;
+        debug!(drive_id = %drive_id, path = %path, "get file by path");
+        if path == "/" || path.is_empty() {
+            return Ok(Some(AliyunFile::new_root()));
+        }
+        let req = GetFileByPathRequest {
+            drive_id,
+            file_path: path,
+        };
+        let res: Result<AliyunFile> = self
+            .request(
+                format!(
+                    "{}/adrive/v1.0/openFile/get_by_path",
+                    self.config.api_base_url
+                ),
+                &req,
+            )
+            .await
+            .and_then(|res| res.context("expect response"));
+        match res {
+            Ok(file) => Ok(Some(file)),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub async fn list_all(&self, parent_file_id: &str) -> Result<Vec<AliyunFile>> {
         let mut files = Vec::new();
         let mut marker = None;
         loop {
             let res = self.list(parent_file_id, marker.as_deref()).await?;
-            files.extend(res.items.into_iter());
+            files.extend(res.items.into_iter().map(|f| f.into()));
             if res.next_marker.is_empty() {
                 break;
             }
@@ -354,50 +447,58 @@ impl AliyunDrive {
             drive_id,
             parent_file_id,
             limit: 200,
-            all: false,
-            image_thumbnail_process: "image/resize,w_400/format,jpeg",
-            image_url_process: "image/resize,w_1920/format,jpeg",
-            video_thumbnail_process: "video/snapshot,t_0,f_jpg,ar_auto,w_300",
             fields: "*",
             order_by: "updated_at",
             order_direction: "DESC",
             marker,
         };
-        self.request(format!("{}/v2/file/list", self.config.api_base_url), &req)
-            .await
-            .and_then(|res| res.context("expect response"))
+        self.request(
+            format!("{}/adrive/v1.0/openFile/list", self.config.api_base_url),
+            &req,
+        )
+        .await
+        .and_then(|res| res.context("expect response"))
     }
 
-    pub async fn download(&self, url: &str, start_pos: u64, size: usize) -> Result<Bytes> {
+    pub async fn download<U: IntoUrl>(&self, url: U, range: Option<(u64, usize)>) -> Result<Bytes> {
         use reqwest::header::RANGE;
 
-        let end_pos = start_pos + size as u64 - 1;
-        debug!(url = %url, start = start_pos, end = end_pos, "download file");
-        let range = format!("bytes={}-{}", start_pos, end_pos);
-        let res = self
-            .client
-            .get(url)
-            .header(RANGE, range)
-            .send()
-            .await?
-            .error_for_status()?;
+        let url = url.into_url()?;
+        let res = if let Some((start_pos, size)) = range {
+            let end_pos = start_pos + size as u64 - 1;
+            debug!(url = %url, start = start_pos, end = end_pos, "download file");
+            let range = format!("bytes={}-{}", start_pos, end_pos);
+            self.client
+                .get(url)
+                .header(RANGE, range)
+                .send()
+                .await?
+                .error_for_status()?
+        } else {
+            debug!(url = %url, "download file");
+            self.client.get(url).send().await?.error_for_status()?
+        };
         Ok(res.bytes().await?)
     }
 
-    pub async fn get_download_url(&self, file_id: &str) -> Result<String> {
+    pub async fn get_download_url(&self, file_id: &str) -> Result<GetFileDownloadUrlResponse> {
         debug!(file_id = %file_id, "get download url");
         let req = GetFileDownloadUrlRequest {
             drive_id: self.drive_id()?,
             file_id,
+            expire_sec: 14400, // 4 hours
         };
         let res: GetFileDownloadUrlResponse = self
             .request(
-                format!("{}/v2/file/get_download_url", self.config.api_base_url),
+                format!(
+                    "{}/adrive/v1.0/openFile/getDownloadUrl",
+                    self.config.api_base_url
+                ),
                 &req,
             )
             .await?
             .context("expect response")?;
-        Ok(res.url)
+        Ok(res)
     }
 
     async fn trash(&self, file_id: &str) -> Result<()> {
@@ -406,12 +507,26 @@ impl AliyunDrive {
             drive_id: self.drive_id()?,
             file_id,
         };
-        let _res: Option<serde::de::IgnoredAny> = self
+        let res: Result<Option<serde::de::IgnoredAny>> = self
             .request(
-                format!("{}/v2/recyclebin/trash", self.config.api_base_url),
+                format!(
+                    "{}/adrive/v1.0/openFile/recyclebin/trash",
+                    self.config.api_base_url
+                ),
                 &req,
             )
-            .await?;
+            .await;
+        if let Err(err) = res {
+            if let Some(req_err) = err.downcast_ref::<reqwest::Error>() {
+                // Ignore 404 and 400 status codes
+                if !matches!(
+                    req_err.status(),
+                    Some(StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)
+                ) {
+                    return Err(err);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -421,9 +536,23 @@ impl AliyunDrive {
             drive_id: self.drive_id()?,
             file_id,
         };
-        let _res: Option<serde::de::IgnoredAny> = self
-            .request(format!("{}/v2/file/delete", self.config.api_base_url), &req)
-            .await?;
+        let res: Result<Option<serde::de::IgnoredAny>> = self
+            .request(
+                format!("{}/adrive/v1.0/openFile/delete", self.config.api_base_url),
+                &req,
+            )
+            .await;
+        if let Err(err) = res {
+            if let Some(req_err) = err.downcast_ref::<reqwest::Error>() {
+                // Ignore 404 and 400 status codes
+                if !matches!(
+                    req_err.status(),
+                    Some(StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST)
+                ) {
+                    return Err(err);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -446,7 +575,10 @@ impl AliyunDrive {
             r#type: "folder",
         };
         let _res: Option<serde::de::IgnoredAny> = self
-            .request(format!("{}/v2/file/create", self.config.api_base_url), &req)
+            .request(
+                format!("{}/adrive/v1.0/openFile/create", self.config.api_base_url),
+                &req,
+            )
             .await?;
         Ok(())
     }
@@ -454,13 +586,15 @@ impl AliyunDrive {
     pub async fn rename_file(&self, file_id: &str, name: &str) -> Result<()> {
         debug!(file_id = %file_id, name = %name, "rename file");
         let req = RenameFileRequest {
-            check_name_mode: "refuse",
             drive_id: self.drive_id()?,
             file_id,
             name,
         };
         let _res: Option<serde::de::IgnoredAny> = self
-            .request(format!("{}/v2/file/update", self.config.api_base_url), &req)
+            .request(
+                format!("{}/adrive/v1.0/openFile/update", self.config.api_base_url),
+                &req,
+            )
             .await?;
         Ok(())
     }
@@ -476,32 +610,32 @@ impl AliyunDrive {
         let req = MoveFileRequest {
             drive_id,
             file_id,
-            to_drive_id: drive_id,
             to_parent_file_id,
             new_name,
         };
         let _res: Option<serde::de::IgnoredAny> = self
-            .request(format!("{}/v2/file/move", self.config.api_base_url), &req)
+            .request(
+                format!("{}/adrive/v1.0/openFile/move", self.config.api_base_url),
+                &req,
+            )
             .await?;
         Ok(())
     }
 
-    pub async fn copy_file(
-        &self,
-        file_id: &str,
-        to_parent_file_id: &str,
-        new_name: Option<&str>,
-    ) -> Result<()> {
+    pub async fn copy_file(&self, file_id: &str, to_parent_file_id: &str) -> Result<()> {
         debug!(file_id = %file_id, to_parent_file_id = %to_parent_file_id, "copy file");
         let drive_id = self.drive_id()?;
         let req = CopyFileRequest {
             drive_id,
             file_id,
             to_parent_file_id,
-            new_name,
+            auto_rename: false,
         };
         let _res: Option<serde::de::IgnoredAny> = self
-            .request(format!("{}/v2/file/copy", self.config.api_base_url), &req)
+            .request(
+                format!("{}/adrive/v1.0/openFile/copy", self.config.api_base_url),
+                &req,
+            )
             .await?;
         Ok(())
     }
@@ -536,7 +670,7 @@ impl AliyunDrive {
         };
         let res: CreateFileWithProofResponse = self
             .request(
-                format!("{}/v2/file/create_with_proof", self.config.api_base_url),
+                format!("{}/adrive/v1.0/openFile/create", self.config.api_base_url),
                 &req,
             )
             .await?
@@ -554,7 +688,7 @@ impl AliyunDrive {
         };
         let _res: Option<serde::de::IgnoredAny> = self
             .request(
-                format!("{}/v2/file/complete", self.config.api_base_url),
+                format!("{}/adrive/v1.0/openFile/complete", self.config.api_base_url),
                 &req,
             )
             .await?;
@@ -562,12 +696,14 @@ impl AliyunDrive {
     }
 
     pub async fn upload(&self, url: &str, body: Bytes) -> Result<()> {
-        self.client
-            .put(url)
-            .body(body)
-            .send()
-            .await?
-            .error_for_status()?;
+        let res = self.client.put(url).body(body).send().await?;
+        if let Err(err) = res.error_for_status_ref() {
+            let detail = res
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+            bail!("{}: {}", err, detail);
+        }
         Ok(())
     }
 
@@ -593,7 +729,10 @@ impl AliyunDrive {
         };
         let res: CreateFileWithProofResponse = self
             .request(
-                format!("{}/v2/file/get_upload_url", self.config.api_base_url),
+                format!(
+                    "{}/adrive/v1.0/openFile/getUploadUrl",
+                    self.config.api_base_url
+                ),
                 &req,
             )
             .await?
@@ -605,11 +744,17 @@ impl AliyunDrive {
         let drive_id = self.drive_id()?;
         let mut data = HashMap::new();
         data.insert("drive_id", drive_id);
-        let res: GetDriveResponse = self
-            .request(format!("{}/v2/drive/get", self.config.api_base_url), &data)
+        let res: GetSpaceInfoResponse = self
+            .request(
+                format!("{}/adrive/v1.0/user/getSpaceInfo", self.config.api_base_url),
+                &data,
+            )
             .await?
             .context("expect response")?;
-        Ok((res.used_size, res.total_size))
+        Ok((
+            res.personal_space_info.used_size,
+            res.personal_space_info.total_size,
+        ))
     }
 }
 
@@ -639,4 +784,16 @@ impl DavDirEntry for AliyunFile {
     fn metadata(&self) -> FsFuture<Box<dyn DavMetaData>> {
         async move { Ok(Box::new(self.clone()) as Box<dyn DavMetaData>) }.boxed()
     }
+}
+
+pub async fn read_refresh_token(workdir: &Path) -> Result<String> {
+    let file = workdir.join("refresh_token");
+    let token = tokio::fs::read_to_string(&file).await?;
+    if token.split('.').count() < 3 {
+        bail!(
+            "Please remove outdated refresh_token cache for v1.x at {}",
+            file.display(),
+        );
+    }
+    Ok(token)
 }
